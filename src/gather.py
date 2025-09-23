@@ -80,5 +80,26 @@ def scrape_article(url: str) -> str:
             return None
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Heuristic: grab <p> text
-        paragraphs = [p.get_text(" ", strip=_]()
+        # FIXED: correct list comprehension
+        paragraphs = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
+        text = " ".join(paragraphs)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+    except Exception as e:
+        print(f"[gather] ERROR scraping {url}: {e}")
+        return None
+
+
+def _parse_date(pub: str):
+    try:
+        return datetime(*feedparser._parse_date(pub)[:6])
+    except Exception:
+        return datetime.utcnow()
+
+
+def _source_from_link(url: str) -> str:
+    try:
+        return urlparse(url).netloc
+    except Exception:
+        return "unknown"
+
