@@ -1,6 +1,11 @@
-import os, sys, glob, pytz
+# src/main.py
+import os
+import sys
+import glob
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
+
+import pytz
 import yaml
 
 # Allow imports from src directory when run as "python src/main.py"
@@ -9,7 +14,7 @@ if THIS_DIR not in sys.path:
     sys.path.insert(0, THIS_DIR)
 
 from gather import fetch_feeds, select_and_enrich
-from tts import synth_to_mp3
+from tts import synth_to_mp3                 # gTTS-based in src/tts.py
 from build_feed import build_podcast_feed
 from utils import clean_whitespace
 
@@ -17,13 +22,19 @@ ROOT = os.path.abspath(os.path.join(THIS_DIR, ".."))
 DOCS = os.path.join(ROOT, "docs")
 AUDIO = os.path.join(DOCS, "audio")
 
+
+# ----------------------------
+# Helpers
+# ----------------------------
 def load_config() -> Dict[str, Any]:
     with open(os.path.join(ROOT, "config.yaml"), "r") as f:
         return yaml.safe_load(f)
 
+
 def load_terms() -> List[str]:
     with open(os.path.join(ROOT, "isd_terms.txt"), "r") as f:
         return [clean_whitespace(x) for x in f.read().splitlines() if clean_whitespace(x)]
+
 
 def read_whitelist(cfg: Dict[str, Any]):
     wl = cfg.get("whitelist_domains")
@@ -37,11 +48,14 @@ def read_whitelist(cfg: Dict[str, Any]):
         return out
     return None
 
+
 def format_intro(now_local: datetime) -> str:
     return f"Good morning. Here is your Greater Houston Independent School Districts roundup for {now_local.strftime('%A, %B %d, %Y')}."
 
+
 def format_outro() -> str:
     return "That’s all for today. Source links are in the show notes. See you tomorrow."
+
 
 def build_script(items: List[Dict[str, Any]], tzname: str):
     tz = pytz.timezone(tzname)
@@ -65,35 +79,40 @@ def build_script(items: List[Dict[str, Any]], tzname: str):
     notes = "\n".join(notes_lines)
     return script_text, notes
 
+
 def bytes_of(path: str) -> int:
     return os.path.getsize(path) if os.path.exists(path) else 0
 
+
 def cleanup_old_audio(retain_days: int):
-    cutoff = datetime.utcnow() - timedelta(days=retain_days)
+    """Remove old MP3s older than retain_days (timezone-aware)."""
+    cutoff = datetime.now(pytz.utc) - timedelta(days=retain_days)
     for mp3 in glob.glob(os.path.join(AUDIO, "*.mp3")):
         name = os.path.basename(mp3)
         try:
             date_part = name.split("_")[-1].replace(".mp3", "")
-            dt = datetime.strptime(date_part, "%Y-%m-%d")
+            dt = pytz.utc.localize(datetime.strptime(date_part, "%Y-%m-%d"))
             if dt < cutoff:
                 os.remove(mp3)
         except Exception:
             continue
 
+
 def load_existing_episodes(site_base_url: str):
+    """Return existing episodes (one per MP3) with timezone-aware dates."""
     eps = []
     for mp3 in sorted(glob.glob(os.path.join(AUDIO, "*.mp3")), reverse=True):
         name = os.path.basename(mp3)
         date_part = name.split("_")[-1].replace(".mp3", "")
         try:
-            dt = datetime.strptime(date_part, "%Y-%m-%d")
+            dt = pytz.utc.localize(datetime.strptime(date_part, "%Y-%m-%d"))
         except Exception:
-            dt = datetime.utcnow()
+            dt = datetime.now(pytz.utc)
         url = f"{site_base_url}/audio/{name}"
         length = bytes_of(mp3)
         eps.append({
             "title": f"Houston ISD Roundup — {date_part}",
-            "date": dt,
+            "date": dt,                    # tz-aware datetime
             "url": url,
             "length": length,
             "page_url": site_base_url,
@@ -101,6 +120,10 @@ def load_existing_episodes(site_base_url: str):
         })
     return eps
 
+
+# ----------------------------
+# Main
+# ----------------------------
 def main():
     os.makedirs(DOCS, exist_ok=True)
     os.makedirs(AUDIO, exist_ok=True)
@@ -109,6 +132,7 @@ def main():
     terms = load_terms()
     whitelist = read_whitelist(cfg)
 
+    # Gather and select content
     raw_items = fetch_feeds(terms)
     items = select_and_enrich(
         raw_items,
@@ -121,8 +145,10 @@ def main():
     today_str = datetime.now(pytz.timezone(tzname)).strftime("%Y-%m-%d")
     base_name = f"{cfg.get('episode_prefix','houston-isd-roundup')}_{today_str}"
 
+    # Build narration and notes
     script_text, notes = build_script(items, tzname)
 
+    # TTS -> MP3 (gTTS version ignores voice/rate but we keep the interface)
     final_mp3 = synth_to_mp3(
         chunks=[script_text],
         voice=cfg.get("voice", "en-US-AriaNeural"),
@@ -131,15 +157,19 @@ def main():
         basename=base_name
     )
 
+    # Write show notes
     notes_path = os.path.join(DOCS, f"{base_name}.txt")
     with open(notes_path, "w") as f:
         f.write(notes)
 
+    # Cleanup old audio
     cleanup_old_audio(int(cfg.get("retain_days", 14)))
 
+    # Build/refresh RSS feed
     site_base_url = cfg["site_base_url"].rstrip("/")
     episodes = load_existing_episodes(site_base_url)
 
+    # Attach notes page to today's episode
     for ep in episodes:
         if ep["url"].endswith(f"{base_name}.mp3"):
             ep["summary"] = notes.replace("\n", "<br/>")
@@ -149,13 +179,14 @@ def main():
     feed_path = os.path.join(DOCS, "feed.xml")
     build_podcast_feed(
         site_base_url=site_base_url,
-        show_title=cfg.get("show_title","Greater Houston ISD Daily"),
-        show_description=cfg.get("show_description","Daily readouts of last-24-hour news about Greater Houston ISDs."),
-        show_author=cfg.get("show_author","PlayHereHouston"),
-        show_email=cfg.get("show_email","you@example.com"),
+        show_title=cfg.get("show_title", "Greater Houston ISD Daily"),
+        show_description=cfg.get("show_description", "Daily readouts of last-24-hour news about Greater Houston ISDs."),
+        show_author=cfg.get("show_author", "PlayHereHouston"),
+        show_email=cfg.get("show_email", "you@example.com"),
         episodes=episodes,
         out_feed_path=feed_path
     )
+
 
 if __name__ == "__main__":
     main()
