@@ -1,8 +1,9 @@
 name: Daily Build
 
 on:
-  schedule:
-    - cron: "30 12 * * *"   # 12:30 UTC (~ morning Central)
+ schedule:
+  - cron: "0 10 * * *"   # 5:00 AM CT during Daylight Saving
+  - cron: "0 11 * * *"
   workflow_dispatch:
 
 permissions:
