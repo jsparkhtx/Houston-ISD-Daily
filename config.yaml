@@ -1,0 +1,27 @@
+site_base_url: "https://USERNAME.github.io/REPO"   # CHANGE to your GitHub Pages URL
+show_title: "Greater Houston ISD Daily"
+show_description: "Daily readouts of last-24-hour news about Greater Houston Independent School Districts."
+show_author: "PlayHereHouston"
+show_email: "you@example.com"
+timezone: "America/Chicago"
+max_articles: 12
+max_chars_per_article: 2000
+voice: "en-US-AriaNeural"     # edge-tts voice
+voice_rate: "+0%"
+retain_days: 14
+episode_prefix: "houston-isd-roundup"
+# whitelist_domains:
+#   - "houstonchronicle.com"
+#   - "abc13.com"
+#   - "khou.com"
+#   - "click2houston.com"
+#   - "communityimpact.com"
+#   - "houstonpublicmedia.org"
+#   - "houstonisd.org"
+#   - "fortbendisd.com"
+#   - "katyisd.org"
+#   - "humbleisd.net"
+#   - "pasadenaisd.org"
+#   - "springbranchisd.com"
+#   - "springisd.org"
+#   - "kleinisd.net"
