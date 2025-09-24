@@ -7,12 +7,14 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, quote_plus
 
+# readability first, soup as fallback
+from readability import Document
+
 
 def fetch_feeds(terms: List[str]) -> List[Dict[str, Any]]:
-    """Fetch Google News RSS feeds for each search term."""
+    """Fetch Google News RSS feeds for each search term (last 2 days)."""
     all_items = []
     for term in terms:
-        # URL-encode the quoted term to avoid spaces/control chars in the URL
         q = quote_plus(f'"{term}"')  # e.g., "Houston ISD" -> %22Houston+ISD%22
         url = f"https://news.google.com/rss/search?q={q}+when:2d&hl=en-US&gl=US&ceid=US:en"
 
@@ -40,47 +42,63 @@ def select_and_enrich(
     max_chars: int = 2000,
 ) -> List[Dict[str, Any]]:
     """
-    Filter, deduplicate, and enrich articles.
-    Falls back to RSS summary text when full-page scrape fails.
+    Filter, deduplicate, and enrich articles with readable text.
+    Order: readability -> soup <p> -> cleaned RSS summary.
     """
     seen_links = set()
     selected = []
 
+    # newest first
     for it in sorted(items, key=lambda x: x["published"] or datetime.utcnow(), reverse=True):
         if it["link"] in seen_links:
             continue
 
-        if whitelist_domains:
-            domain = urlparse(it["link"]).netloc.lower()
-            if domain.startswith("www."):
-                domain = domain[4:]
-            if domain not in whitelist_domains:
-                print(f"[gather] SKIP (domain not in whitelist): {it['title']} — {domain}")
-                continue
+        domain = urlparse(it["link"]).netloc.lower()
+        if domain.startswith("www."):
+            domain = domain[4:]
 
-        # Try to scrape full article text
-        body = scrape_article(it["link"])
+        if whitelist_domains and domain not in whitelist_domains:
+            print(f"[gather] SKIP (domain not in whitelist): {it['title']} — {domain}")
+            continue
 
-        # Fallback: clean RSS summary if scraping failed/empty
+        # 1) readability
+        body = extract_readable(it["link"])
+        method = "readability"
+
+        # 2) soup fallback
+        if not body or len(body) < 280:  # too short? try soup
+            soup_body = extract_soup(it["link"])
+            if soup_body and len(soup_body) > (len(body) if body else 0):
+                body = soup_body
+                method = "soup"
+
+        # 3) RSS summary fallback
+        if not body or len(body) < 200:
+            summary = _clean_html(it.get("summary", "") or "")
+            if summary:
+                # Prefer summary only if it actually adds content
+                if not body or len(summary) > len(body):
+                    body = summary
+                    method = "rss-summary"
+
         if not body:
-            fallback = _clean_html(it.get("summary", "") or "")
-            if fallback:
-                body = fallback
-                print(f"[gather] FALLBACK summary used for: {it['title']}")
-            else:
-                print(f"[gather] SKIP (no body & no summary): {it['title']}")
-                continue
+            print(f"[gather] SKIP (no usable body): {it['title']} — {domain}")
+            continue
 
-        # Trim overly long text
+        # Heuristics: trim boilerplate
+        body = strip_boilerplate(body)
+
+        # cap to max_chars (config)
         if len(body) > max_chars:
             body = body[: max_chars] + "…"
 
         it["body"] = body
+        it["source"] = domain
         snippet = body[:120].replace("\n", " ")
-        print(f"[gather] KEPT: {it['title']} — snippet: {snippet}…")
+        print(f"[gather] KEPT via {method}: {it['title']} — {domain} — len={len(body)} — snippet: {snippet}…")
+
         selected.append(it)
         seen_links.add(it["link"])
-
         if len(selected) >= max_articles:
             break
 
@@ -88,29 +106,76 @@ def select_and_enrich(
     return selected
 
 
-def scrape_article(url: str) -> str:
-    """Fetch and extract readable text from a URL."""
+# -----------------
+# Extractors
+# -----------------
+def extract_readable(url: str) -> str | None:
+    """Extract main content using readability-lxml."""
+    try:
+        html = _get(url)
+        if not html:
+            return None
+        doc = Document(html)
+        article_html = doc.summary(html_partial=True)
+        text = _clean_html(article_html)
+        return text or None
+    except Exception as e:
+        print(f"[gather] readability ERROR for {url}: {e}")
+        return None
+
+
+def extract_soup(url: str) -> str | None:
+    """Fallback: join <p> tags text with BeautifulSoup."""
+    try:
+        html = _get(url)
+        if not html:
+            return None
+        soup = BeautifulSoup(html, "html.parser")
+        paragraphs = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
+        text = " ".join(paragraphs)
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            print(f"[gather] WARNING: soup found no text for {url}")
+        return text or None
+    except Exception as e:
+        print(f"[gather] soup ERROR for {url}: {e}")
+        return None
+
+
+def _get(url: str) -> str | None:
     try:
         resp = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
         if resp.status_code != 200:
             print(f"[gather] ERROR {resp.status_code} fetching {url}")
             return None
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        # Simple heuristic: join all paragraph text
-        paragraphs = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
-        text = " ".join(paragraphs)
-        text = re.sub(r"\s+", " ", text).strip()
-        if not text:
-            print(f"[gather] WARNING: No text extracted from {url}")
-        return text or None
+        return resp.text
     except Exception as e:
-        print(f"[gather] ERROR scraping {url}: {e}")
+        print(f"[gather] GET ERROR for {url}: {e}")
         return None
 
 
+# -----------------
+# Utilities
+# -----------------
+def strip_boilerplate(text: str) -> str:
+    """Remove obvious boilerplate / social prompts."""
+    # light heuristics — adjust as needed
+    bads = [
+        "Subscribe to our newsletter",
+        "All rights reserved",
+        "Continue Reading",
+        "Advertisement",
+        "Ad – ",
+        "Sign up for our",
+        "Copyright",
+    ]
+    for b in bads:
+        text = text.replace(b, " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def _clean_html(html: str) -> str:
-    """Strip tags/whitespace from RSS summary HTML."""
+    """Strip tags/whitespace from HTML."""
     if not html:
         return ""
     soup = BeautifulSoup(html, "html.parser")
