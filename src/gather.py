@@ -18,8 +18,39 @@ UA = {
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://news.google.com/",
 }
-NEWS_HOST = "news.google.com"
 
+NEWS_HOST = "news.google.com"
+BLOCKED_NETLOCS = {
+    "news.google.com",
+    "www.google.com",
+    "google.com",
+    "gstatic.com",
+    "www.gstatic.com",
+    "googleusercontent.com",
+    "www.googleusercontent.com",
+    "gvt2.com",
+    "www.gvt2.com",
+}
+
+def _is_blocked(url: str) -> bool:
+    if not url:
+        return True
+    net = (urlparse(url).netloc or "").lower()
+    if net.startswith("www."):
+        net = net[4:]
+    if net in BLOCKED_NETLOCS:
+        return True
+    # Block annoying script endpoints
+    if "gstatic.com" in net and "/_/boq-dots/" in url:
+        return True
+    return False
+
+def _domain_of(url: str) -> str:
+    try:
+        d = urlparse(url).netloc.lower()
+        return d[4:] if d.startswith("www.") else d
+    except Exception:
+        return "unknown"
 
 # ----------------------------------------------------
 # Google News unwrapping (incl. JSON-LD/script scraping)
@@ -38,7 +69,7 @@ def _unwrap_google_entry(entry) -> str:
     # 1) explicit original link
     try:
         orig = getattr(entry, "feedburner_origlink", None) or entry.get("feedburner_origlink")
-        if orig and NEWS_HOST not in urlparse(orig).netloc:
+        if orig and not _is_blocked(orig):
             return orig
     except Exception:
         pass
@@ -47,9 +78,7 @@ def _unwrap_google_entry(entry) -> str:
     try:
         for l in entry.get("links", []):
             href = l.get("href")
-            if not href:
-                continue
-            if NEWS_HOST not in urlparse(href).netloc:
+            if href and not _is_blocked(href):
                 return href
     except Exception:
         pass
@@ -61,9 +90,9 @@ def _unwrap_google_entry(entry) -> str:
             if href.startswith("./"):
                 href_abs = urljoin(f"https://{NEWS_HOST}/", href)
                 real = _resolve_news_google_link(href_abs)
-                if real:
+                if real and not _is_blocked(real):
                     return real
-            if NEWS_HOST not in urlparse(href).netloc:
+            if href and not _is_blocked(href):
                 return href
     except Exception:
         pass
@@ -72,11 +101,11 @@ def _unwrap_google_entry(entry) -> str:
     try:
         link = entry.link
         parsed = urlsplit(link)
-        if NEWS_HOST in parsed.netloc:
+        if NEWS_HOST in (parsed.netloc or "").lower():
             qs = parse_qs(parsed.query)
             if "url" in qs and qs["url"]:
                 real = unquote(qs["url"][0])
-                if real:
+                if real and not _is_blocked(real):
                     return real
     except Exception:
         pass
@@ -84,9 +113,9 @@ def _unwrap_google_entry(entry) -> str:
     # 5) resolve any google link
     try:
         link = entry.link
-        if NEWS_HOST in urlparse(link).netloc:
+        if NEWS_HOST in (urlparse(link).netloc or "").lower():
             real = _resolve_news_google_link(link)
-            if real:
+            if real and not _is_blocked(real):
                 return real
     except Exception:
         pass
@@ -97,7 +126,6 @@ def _unwrap_google_entry(entry) -> str:
     except Exception:
         return ""
 
-
 def _resolve_news_google_link(google_url: str) -> Optional[str]:
     """
     Resolve a news.google.com URL to the publisher URL. Handles:
@@ -106,7 +134,7 @@ def _resolve_news_google_link(google_url: str) -> Optional[str]:
       - "Continue" anchors
       - relative ./articles/* links (follows one extra hop)
       - JSON-LD <script> with "url"
-      - any absolute URLs embedded in script text
+      - any absolute URLs embedded in script text (filtered)
     """
     try:
         if google_url.startswith("./"):
@@ -114,7 +142,7 @@ def _resolve_news_google_link(google_url: str) -> Optional[str]:
 
         r = requests.get(google_url, headers=UA, timeout=12, allow_redirects=True)
         # If we already landed off Google, done.
-        if r.status_code == 200 and r.url and NEWS_HOST not in urlparse(r.url).netloc:
+        if r.status_code == 200 and r.url and not _is_blocked(r.url):
             return r.url
 
         html = r.text or ""
@@ -122,89 +150,74 @@ def _resolve_news_google_link(google_url: str) -> Optional[str]:
             return None
         soup = BeautifulSoup(html, "html.parser")
 
+        candidates: List[str] = []
+
         # meta refresh
         meta = soup.find("meta", attrs={"http-equiv": re.compile(r"refresh", re.I)})
         if meta:
             content = meta.get("content") or ""
             m = re.search(r"url\s*=\s*([^;]+)", content, flags=re.I)
             if m:
-                dst = m.group(1).strip().strip("'\"")
-                if dst:
-                    dst = _absolutize_google_href(dst)
-                    if _is_publisher(dst):
-                        return dst
+                candidates.append(_absolutize_google_href(m.group(1).strip().strip("'\"")))
 
-        # explicit anchors
+        # anchors
         for a in soup.find_all("a", href=True):
             href = _absolutize_google_href(a["href"])
-            if _is_publisher(href):
-                return href
+            candidates.append(href)
             # follow one more ./articles hop
             if _is_google_article(href):
-                r2 = requests.get(href, headers=UA, timeout=12, allow_redirects=True)
-                if r2.status_code == 200 and r2.url and _is_publisher(r2.url):
-                    return r2.url
-                soup2 = BeautifulSoup(r2.text or "", "html.parser")
-                # repeat meta/anchors/canonical for hop
-                dst = _extract_from_html_variants(soup2)
-                if _is_publisher(dst):
-                    return dst
+                try:
+                    r2 = requests.get(href, headers=UA, timeout=12, allow_redirects=True)
+                    if r2.status_code == 200 and r2.url and not _is_blocked(r2.url):
+                        candidates.append(r2.url)
+                    soup2 = BeautifulSoup(r2.text or "", "html.parser")
+                    candidates.extend(_extract_from_html_variants(soup2))
+                except Exception:
+                    pass
 
         # canonical
         canon = soup.find("link", rel=lambda x: x and "canonical" in x)
         if canon:
-            href = _absolutize_google_href(canon.get("href") or "")
-            if _is_publisher(href):
-                return href
+            candidates.append(_absolutize_google_href(canon.get("href") or ""))
 
         # JSON-LD blocks
         for s in soup.find_all("script", type=lambda x: x and "ld+json" in x):
             text = s.get_text(strip=True)
             try:
                 data = json.loads(text)
+                for u in _walk_urls_in_json(data):
+                    candidates.append(u)
             except Exception:
-                # Sometimes multiple JSON objects jammed together; extract URLs via regex.
-                for u in _urls_from_text(text):
-                    if _is_publisher(u):
-                        return u
-                continue
-            # Search for any "url" fields in objects/arrays
-            for u in _walk_urls_in_json(data):
-                if _is_publisher(u):
-                    return u
+                # fallback: regex any URLs in the JSON text
+                candidates.extend(_urls_from_text(text))
 
         # Any absolute URLs in any script content (last resort)
         for s in soup.find_all("script"):
-            for u in _urls_from_text(s.get_text() or ""):
-                if _is_publisher(u):
-                    return u
+            candidates.extend(_urls_from_text(s.get_text() or ""))
 
+        # Filter and return the first publisher-looking URL
+        for u in candidates:
+            if not _is_blocked(u) and u.startswith("http"):
+                return u
     except Exception:
         return None
 
     return None
 
-
-def _extract_from_html_variants(soup: BeautifulSoup) -> Optional[str]:
-    # meta refresh
+def _extract_from_html_variants(soup: BeautifulSoup) -> List[str]:
+    out: List[str] = []
     meta = soup.find("meta", attrs={"http-equiv": re.compile(r"refresh", re.I)})
     if meta:
         content = meta.get("content") or ""
         m = re.search(r"url\s*=\s*([^;]+)", content, flags=re.I)
         if m:
-            return _absolutize_google_href(m.group(1).strip().strip("'\""))
-
-    # anchors
+            out.append(_absolutize_google_href(m.group(1).strip().strip("'\"")))
     for a in soup.find_all("a", href=True):
-        return _absolutize_google_href(a["href"])
-
-    # canonical
+        out.append(_absolutize_google_href(a["href"]))
     link_canon = soup.find("link", rel=lambda x: x and "canonical" in x)
     if link_canon:
-        return _absolutize_google_href(link_canon.get("href") or "")
-
-    return None
-
+        out.append(_absolutize_google_href(link_canon.get("href") or ""))
+    return out
 
 def _absolutize_google_href(href: str) -> str:
     if not href:
@@ -213,25 +226,17 @@ def _absolutize_google_href(href: str) -> str:
         return urljoin(f"https://{NEWS_HOST}/", href)
     return href
 
-
 def _is_google_article(url: str) -> bool:
     if not url:
         return False
-    net = urlparse(url).netloc.lower()
-    return NEWS_HOST in net
+    return NEWS_HOST in (urlparse(url).netloc or "").lower()
 
-
-def _is_publisher(url: str) -> bool:
-    if not url:
-        return False
-    net = urlparse(url).netloc.lower()
-    return bool(net) and NEWS_HOST not in net and "google." not in net
-
+def _hrefs_from_html(html: str) -> List[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    return [a["href"] for a in soup.find_all("a", href=True)]
 
 def _urls_from_text(text: str) -> List[str]:
-    # crude absolute URL finder
     return re.findall(r"https?://[^\s\"'<>()]+", text or "")
-
 
 def _walk_urls_in_json(obj) -> Iterable[str]:
     if isinstance(obj, dict):
@@ -244,22 +249,8 @@ def _walk_urls_in_json(obj) -> Iterable[str]:
         for it in obj:
             yield from _walk_urls_in_json(it)
 
-
-def _hrefs_from_html(html: str) -> List[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    return [a["href"] for a in soup.find_all("a", href=True)]
-
-
-def _domain_of(url: str) -> str:
-    try:
-        d = urlparse(url).netloc.lower()
-        return d[4:] if d.startswith("www.") else d
-    except Exception:
-        return "unknown"
-
-
 # -----------------------------
-# Fetch
+# Fetch Google News RSS
 # -----------------------------
 def fetch_feeds(terms: List[str]) -> List[Dict[str, Any]]:
     """Fetch Google News RSS results for each term (last 2 days)."""
@@ -287,7 +278,6 @@ def fetch_feeds(terms: List[str]) -> List[Dict[str, Any]]:
 
     return all_items
 
-
 # -----------------------------
 # Select & Enrich
 # -----------------------------
@@ -311,11 +301,14 @@ def select_and_enrich(
     for it in sorted(items, key=lambda x: x["published"] or datetime.utcnow(), reverse=True):
         url = it["link"]
         dom = it.get("source") or _domain_of(url)
-        key = (it["title"], url)
-        if key in seen or not url:
+        if not url or _is_blocked(url):
+            print(f"[gather] SKIP (blocked url): {it.get('title')}")
             continue
 
-        # require ISD/district phrases in title or summary
+        key = (it["title"], url)
+        if key in seen:
+            continue
+
         title_l = (it.get("title") or "").lower()
         summary_l = (it.get("summary") or "").lower()
         if mm and not _title_or_summary_matches(title_l, summary_l, mm):
@@ -328,7 +321,6 @@ def select_and_enrich(
 
         body, method = _extract_body(url)
 
-        # Fallbacks
         if not body or len(body) < 200:
             og = _fetch_og_description(url)
             if og and len(og) > (len(body) if body else 0):
@@ -360,7 +352,6 @@ def select_and_enrich(
     print(f"[gather] selected {len(selected)} articles (limit={max_articles})")
     return selected
 
-
 def _title_or_summary_matches(title_l: str, summary_l: str, terms: Iterable[str]) -> bool:
     if "isd" in title_l or "isd" in summary_l:
         return True
@@ -368,7 +359,6 @@ def _title_or_summary_matches(title_l: str, summary_l: str, terms: Iterable[str]
         if t in title_l or t in summary_l:
             return True
     return False
-
 
 # -----------------------------
 # Extraction helpers
@@ -403,7 +393,6 @@ def _extract_body(url: str) -> Tuple[Optional[str], str]:
 
     return None, "none"
 
-
 def _fetch_og_description(url: str) -> Optional[str]:
     try:
         html = _get(url)
@@ -419,7 +408,6 @@ def _fetch_og_description(url: str) -> Optional[str]:
         return None
     return None
 
-
 def _get(url: str) -> Optional[str]:
     try:
         r = requests.get(url, timeout=12, headers=UA)
@@ -430,7 +418,6 @@ def _get(url: str) -> Optional[str]:
     except Exception as e:
         print(f"[gather] GET ERROR for {url}: {e}")
         return None
-
 
 # -----------------------------
 # Text utilities
@@ -449,14 +436,12 @@ def strip_boilerplate(text: str) -> str:
         text = text.replace(b, " ")
     return re.sub(r"\s+", " ", text).strip()
 
-
 def _clean_html(html: str) -> str:
     if not html:
         return ""
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(" ", strip=True)
     return re.sub(r"\s+", " ", text).strip()
-
 
 def _parse_date(pub: Optional[str]):
     try:
