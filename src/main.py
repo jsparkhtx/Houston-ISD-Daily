@@ -162,6 +162,10 @@ def main():
     with open(notes_path, "w") as f:
         f.write(notes)
 
+    script_path = os.path.join(DOCS, f"{base_name}_script.txt")
+with open(script_path, "w") as f:
+    f.write(script_text)
+
     # Cleanup old audio
     cleanup_old_audio(int(cfg.get("retain_days", 14)))
 
