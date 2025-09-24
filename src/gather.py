@@ -10,21 +10,25 @@ from bs4 import BeautifulSoup
 from readability import Document
 
 
-# -----------------------------
-# Robust publisher-link unwrap
-# -----------------------------
-def _unwrap_google_news_link(entry) -> str:
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
+
+
+# ----------------------------------------------------
+# Google News unwrapping (handles meta-refresh pages)
+# ----------------------------------------------------
+def _unwrap_google_entry(entry) -> str:
     """
-    Try hard to get the real publisher URL from a Google News RSS entry.
-    Priority:
-      1) feedburner_origlink (some feeds)
-      2) any entry.links[].href not pointing to news.google.com
-      3) first <a href> in the summary that is not news.google.com
-      4) link's ?url= param if present
-      5) follow redirects once and take final URL if it leaves news.google.com
-      6) fallback to entry.link
+    Return the publisher URL for a Google News RSS entry.
+    Tries (in order):
+      1) feedburner_origlink
+      2) first entry.links[].href not on news.google.com
+      3) first <a href> inside summary not on news.google.com
+      4) link's ?url= param
+      5) GET the news.google.com page and parse meta-refresh / 'Continue' link
+      6) final fallback: entry.link
     """
-    # 1) feedburner_origlink
+    # 1) explicit original link
     try:
         orig = getattr(entry, "feedburner_origlink", None) or entry.get("feedburner_origlink")
         if orig and "news.google.com" not in orig:
@@ -32,7 +36,7 @@ def _unwrap_google_news_link(entry) -> str:
     except Exception:
         pass
 
-    # 2) entry.links[] real href
+    # 2) any real link in entry.links
     try:
         for l in entry.get("links", []):
             href = l.get("href")
@@ -41,17 +45,16 @@ def _unwrap_google_news_link(entry) -> str:
     except Exception:
         pass
 
-    # 3) URL inside the summary html
+    # 3) link in summary html
     try:
         sm = entry.get("summary", "") or ""
-        if sm:
-            for href in _hrefs_from_html(sm):
-                if "news.google.com" not in href:
-                    return href
+        for href in _hrefs_from_html(sm):
+            if "news.google.com" not in href:
+                return href
     except Exception:
         pass
 
-    # 4) ?url= param on entry.link
+    # 4) ?url= param
     try:
         link = entry.link
         parsed = urlsplit(link)
@@ -64,17 +67,13 @@ def _unwrap_google_news_link(entry) -> str:
     except Exception:
         pass
 
-    # 5) follow redirect once
+    # 5) fetch the Google page and parse a meta refresh / deep link
     try:
         link = entry.link
-        r = requests.get(
-            link,
-            timeout=10,
-            allow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        if r.status_code == 200 and r.url and "news.google.com" not in r.url:
-            return r.url
+        if "news.google.com" in link:
+            real = _resolve_news_google_html(link)
+            if real:
+                return real
     except Exception:
         pass
 
@@ -85,12 +84,54 @@ def _unwrap_google_news_link(entry) -> str:
         return ""
 
 
+def _resolve_news_google_html(google_link: str) -> Optional[str]:
+    """
+    Some news.google.com article links serve an HTML page with a meta-refresh to
+    the publisher. Fetch and parse that HTML to extract the target URL.
+    """
+    try:
+        r = requests.get(google_link, timeout=12, headers=UA, allow_redirects=True)
+        # If we already landed off Google, great.
+        if r.status_code == 200 and r.url and "news.google.com" not in r.url:
+            return r.url
+
+        html = r.text or ""
+        if not html:
+            return None
+
+        soup = BeautifulSoup(html, "html.parser")
+
+        # <meta http-equiv="refresh" content="0;url=https://publisher/...">
+        meta = soup.find("meta", attrs={"http-equiv": re.compile(r"refresh", re.I)})
+        if meta:
+            content = meta.get("content") or ""
+            m = re.search(r"url\s*=\s*([^;]+)", content, flags=re.I)
+            if m:
+                dst = m.group(1).strip().strip("'\"")
+                if dst and "news.google.com" not in dst:
+                    return dst
+
+        # Sometimes there's an explicit "Continue" anchor
+        a = soup.find("a", href=True)
+        if a:
+            href = a["href"]
+            if href and "news.google.com" not in href:
+                return href
+
+        # As a last resort, look for canonical
+        link_canon = soup.find("link", rel=lambda x: x and "canonical" in x)
+        if link_canon:
+            href = link_canon.get("href")
+            if href and "news.google.com" not in href:
+                return href
+    except Exception:
+        return None
+    return None
+
+
 def _hrefs_from_html(html: str) -> List[str]:
     soup = BeautifulSoup(html, "html.parser")
-    hrefs = []
-    for a in soup.find_all("a", href=True):
-        hrefs.append(a["href"])
-    return hrefs
+    return [a["href"] for a in soup.find_all("a", href=True)]
 
 
 def _domain_of(url: str) -> str:
@@ -108,13 +149,13 @@ def fetch_feeds(terms: List[str]) -> List[Dict[str, Any]]:
     """Fetch Google News RSS results for each term (last 2 days)."""
     all_items: List[Dict[str, Any]] = []
     for term in terms:
-        q = quote_plus(f'"{term}"')  # ensure phrase, URL-encoded
+        q = quote_plus(f'"{term}"')  # phrase match
         url = f"https://news.google.com/rss/search?q={q}+when:2d&hl=en-US&gl=US&ceid=US:en"
         feed = feedparser.parse(url)
         print(f"[gather] term={term!r} fetched={len(feed.entries)} url={url}")
 
         for entry in feed.entries:
-            link = _unwrap_google_news_link(entry)
+            link = _unwrap_google_entry(entry)
             dom = _domain_of(link)
             title = entry.title
 
@@ -143,7 +184,7 @@ def select_and_enrich(
 ) -> List[Dict[str, Any]]:
     """
     Deduplicate, optionally filter by domain/keywords, and enrich with body text.
-    Extraction order: readability -> soup <p> -> cleaned RSS summary fallback.
+    Extraction order: readability -> soup <p> -> og:description -> RSS summary.
     """
     seen = set()
     selected: List[Dict[str, Any]] = []
@@ -155,10 +196,10 @@ def select_and_enrich(
         url = it["link"]
         dom = it.get("source") or _domain_of(url)
         key = (it["title"], url)
-        if key in seen:
+        if key in seen or not url:
             continue
 
-        # keyword guardrail: require 'isd' or a district phrase in title/summary
+        # keep only ISD/district mentions
         title_l = (it.get("title") or "").lower()
         summary_l = (it.get("summary") or "").lower()
         if mm and not _title_or_summary_matches(title_l, summary_l, mm):
@@ -169,15 +210,18 @@ def select_and_enrich(
             print(f"[gather] SKIP (domain not whitelisted): {it['title']} — {dom}")
             continue
 
-        # extract body text
         body, method = _extract_body(url)
 
-        # fallback to RSS summary if extractor came up short
+        # Fallbacks: og:description then RSS summary
+        if not body or len(body) < 200:
+            og = _fetch_og_description(url)
+            if og and len(og) > (len(body) if body else 0):
+                body, method = og, "og:description"
+
         if not body or len(body) < 200:
             fallback = _clean_html(it.get("summary", "") or "")
             if fallback and len(fallback) > (len(body) if body else 0):
-                body = fallback
-                method = "rss-summary"
+                body, method = fallback, "rss-summary"
 
         if not body:
             print(f"[gather] SKIP (no usable body): {it['title']} — {dom}")
@@ -211,7 +255,7 @@ def _title_or_summary_matches(title_l: str, summary_l: str, terms: Iterable[str]
 
 
 # -----------------------------
-# Extraction
+# Extraction helpers
 # -----------------------------
 def _extract_body(url: str) -> Tuple[Optional[str], str]:
     """Return (text, method_used)."""
@@ -245,9 +289,25 @@ def _extract_body(url: str) -> Tuple[Optional[str], str]:
     return None, "none"
 
 
+def _fetch_og_description(url: str) -> Optional[str]:
+    try:
+        html = _get(url)
+        if not html:
+            return None
+        soup = BeautifulSoup(html, "html.parser")
+        og = soup.find("meta", property="og:description") or soup.find("meta", attrs={"name": "description"})
+        if og:
+            desc = (og.get("content") or "").strip()
+            desc = re.sub(r"\s+", " ", desc)
+            return desc if desc else None
+    except Exception:
+        return None
+    return None
+
+
 def _get(url: str) -> Optional[str]:
     try:
-        r = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+        r = requests.get(url, timeout=12, headers=UA)
         if r.status_code != 200:
             print(f"[gather] ERROR {r.status_code} fetching {url}")
             return None
