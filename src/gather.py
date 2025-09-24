@@ -2,45 +2,54 @@
 import re
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import parse_qs, quote_plus, unquote, urlparse, urlsplit
+from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse, urlsplit
 
 import feedparser
 import requests
 from bs4 import BeautifulSoup
 from readability import Document
 
+UA = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://news.google.com/",
+}
 
-UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
+NEWS_HOST = "news.google.com"
 
 
 # ----------------------------------------------------
-# Google News unwrapping (handles meta-refresh pages)
+# Google News unwrapping (handles all common variants)
 # ----------------------------------------------------
 def _unwrap_google_entry(entry) -> str:
     """
     Return the publisher URL for a Google News RSS entry.
     Tries (in order):
       1) feedburner_origlink
-      2) first entry.links[].href not on news.google.com
-      3) first <a href> inside summary not on news.google.com
+      2) entry.links[] href not on news.google.com
+      3) first <a href> in summary not on news.google.com
       4) link's ?url= param
-      5) GET the news.google.com page and parse meta-refresh / 'Continue' link
-      6) final fallback: entry.link
+      5) resolve any news.google.com link (incl. /rss/articles/* and ./articles/*)
+      6) fallback: entry.link
     """
     # 1) explicit original link
     try:
         orig = getattr(entry, "feedburner_origlink", None) or entry.get("feedburner_origlink")
-        if orig and "news.google.com" not in orig:
+        if orig and NEWS_HOST not in urlparse(orig).netloc:
             return orig
     except Exception:
         pass
 
-    # 2) any real link in entry.links
+    # 2) entry.links[]
     try:
         for l in entry.get("links", []):
             href = l.get("href")
-            if href and "news.google.com" not in href:
+            if not href:
+                continue
+            if NEWS_HOST not in urlparse(href).netloc:
                 return href
     except Exception:
         pass
@@ -49,16 +58,22 @@ def _unwrap_google_entry(entry) -> str:
     try:
         sm = entry.get("summary", "") or ""
         for href in _hrefs_from_html(sm):
-            if "news.google.com" not in href:
+            # convert relative ./articles/… to absolute Google URL to resolve
+            if href.startswith("./"):
+                href_abs = urljoin(f"https://{NEWS_HOST}/", href)
+                real = _resolve_news_google_link(href_abs)
+                if real:
+                    return real
+            if NEWS_HOST not in urlparse(href).netloc:
                 return href
     except Exception:
         pass
 
-    # 4) ?url= param
+    # 4) ?url= param on entry.link
     try:
         link = entry.link
         parsed = urlsplit(link)
-        if "news.google.com" in parsed.netloc:
+        if NEWS_HOST in parsed.netloc:
             qs = parse_qs(parsed.query)
             if "url" in qs and qs["url"]:
                 real = unquote(qs["url"][0])
@@ -67,11 +82,11 @@ def _unwrap_google_entry(entry) -> str:
     except Exception:
         pass
 
-    # 5) fetch the Google page and parse a meta refresh / deep link
+    # 5) resolve any news.google.com link (rss/articles/*, /articles/*, or others)
     try:
         link = entry.link
-        if "news.google.com" in link:
-            real = _resolve_news_google_html(link)
+        if NEWS_HOST in urlparse(link).netloc:
+            real = _resolve_news_google_link(link)
             if real:
                 return real
     except Exception:
@@ -84,48 +99,68 @@ def _unwrap_google_entry(entry) -> str:
         return ""
 
 
-def _resolve_news_google_html(google_link: str) -> Optional[str]:
+def _resolve_news_google_link(google_url: str) -> Optional[str]:
     """
-    Some news.google.com article links serve an HTML page with a meta-refresh to
-    the publisher. Fetch and parse that HTML to extract the target URL.
+    Resolve a news.google.com URL to the publisher URL. Handles:
+      - normal redirects
+      - meta-refresh pages
+      - 'Continue' anchors
+      - relative ./articles/* links
     """
     try:
-        r = requests.get(google_link, timeout=12, headers=UA, allow_redirects=True)
-        # If we already landed off Google, great.
-        if r.status_code == 200 and r.url and "news.google.com" not in r.url:
+        # Normalize ./articles/*
+        if google_url.startswith("./"):
+            google_url = urljoin(f"https://{NEWS_HOST}/", google_url)
+
+        r = requests.get(google_url, headers=UA, timeout=12, allow_redirects=True)
+        # If we already landed off Google, we're done.
+        if r.status_code == 200 and r.url and NEWS_HOST not in urlparse(r.url).netloc:
             return r.url
 
         html = r.text or ""
         if not html:
             return None
-
         soup = BeautifulSoup(html, "html.parser")
 
-        # <meta http-equiv="refresh" content="0;url=https://publisher/...">
+        # meta refresh: <meta http-equiv="refresh" content="0;url=https://publisher/...">
         meta = soup.find("meta", attrs={"http-equiv": re.compile(r"refresh", re.I)})
         if meta:
             content = meta.get("content") or ""
             m = re.search(r"url\s*=\s*([^;]+)", content, flags=re.I)
             if m:
                 dst = m.group(1).strip().strip("'\"")
-                if dst and "news.google.com" not in dst:
-                    return dst
+                if dst:
+                    # Some times the URL is relative to Google; join if needed.
+                    if urlparse(dst).netloc == "":
+                        dst = urljoin(f"https://{NEWS_HOST}/", dst)
+                    if NEWS_HOST not in urlparse(dst).netloc:
+                        return dst
 
-        # Sometimes there's an explicit "Continue" anchor
-        a = soup.find("a", href=True)
-        if a:
+        # Common case: "Read full article" / "Continue" anchor
+        for a in soup.find_all("a", href=True):
             href = a["href"]
-            if href and "news.google.com" not in href:
-                return href
+            # Relative article link -> resolve again
+            if href.startswith("./"):
+                href_abs = urljoin(f"https://{NEWS_HOST}/", href)
+                try:
+                    r2 = requests.get(href_abs, headers=UA, timeout=12, allow_redirects=True)
+                    if r2.status_code == 200 and r2.url and NEWS_HOST not in urlparse(r2.url).netloc:
+                        return r2.url
+                except Exception:
+                    continue
+            else:
+                if href and NEWS_HOST not in urlparse(href).netloc and href.startswith("http"):
+                    return href
 
-        # As a last resort, look for canonical
+        # canonical sometimes points to publisher
         link_canon = soup.find("link", rel=lambda x: x and "canonical" in x)
         if link_canon:
-            href = link_canon.get("href")
-            if href and "news.google.com" not in href:
+            href = (link_canon.get("href") or "").strip()
+            if href and NEWS_HOST not in urlparse(href).netloc:
                 return href
     except Exception:
         return None
+
     return None
 
 
@@ -149,24 +184,24 @@ def fetch_feeds(terms: List[str]) -> List[Dict[str, Any]]:
     """Fetch Google News RSS results for each term (last 2 days)."""
     all_items: List[Dict[str, Any]] = []
     for term in terms:
-        q = quote_plus(f'"{term}"')  # phrase match
+        q = quote_plus(f'"{term}"')  # phrase match and URL-encode
         url = f"https://news.google.com/rss/search?q={q}+when:2d&hl=en-US&gl=US&ceid=US:en"
         feed = feedparser.parse(url)
         print(f"[gather] term={term!r} fetched={len(feed.entries)} url={url}")
 
         for entry in feed.entries:
-            link = _unwrap_google_entry(entry)
-            dom = _domain_of(link)
+            resolved = _unwrap_google_entry(entry)
+            dom = _domain_of(resolved)
             title = entry.title
 
             item = {
                 "title": title,
-                "link": link,
+                "link": resolved,
                 "published": _parse_date(entry.get("published")),
                 "summary": entry.get("summary", ""),
                 "source": dom,
             }
-            print(f"[gather] candidate: {title} — {dom} — {link}")
+            print(f"[gather] candidate: {title} — {dom} — {resolved}")
             all_items.append(item)
 
     return all_items
@@ -199,7 +234,7 @@ def select_and_enrich(
         if key in seen or not url:
             continue
 
-        # keep only ISD/district mentions
+        # require ISD / district phrases in title or summary
         title_l = (it.get("title") or "").lower()
         summary_l = (it.get("summary") or "").lower()
         if mm and not _title_or_summary_matches(title_l, summary_l, mm):
@@ -261,7 +296,7 @@ def _extract_body(url: str) -> Tuple[Optional[str], str]:
     """Return (text, method_used)."""
     html: Optional[str] = None
 
-    # 1) readability
+    # 1) readability (best paragraphs)
     try:
         html = _get(url)
         if html:
@@ -273,7 +308,7 @@ def _extract_body(url: str) -> Tuple[Optional[str], str]:
     except Exception as e:
         print(f"[gather] readability ERROR for {url}: {e}")
 
-    # 2) soup <p>
+    # 2) soup <p> fallback
     try:
         html = html or _get(url)
         if html:
