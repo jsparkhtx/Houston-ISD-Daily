@@ -2,13 +2,7 @@
 import re
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import (
-    parse_qs,
-    quote_plus,
-    unquote,
-    urlparse,
-    urlsplit,
-)
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse, urlsplit
 
 import feedparser
 import requests
@@ -17,36 +11,86 @@ from readability import Document
 
 
 # -----------------------------
-# URL helpers
+# Robust publisher-link unwrap
 # -----------------------------
-def _unwrap_google_news_link(link: str) -> str:
+def _unwrap_google_news_link(entry) -> str:
     """
-    Google News RSS often points at news.google.com which redirects to the real
-    publisher article. Prefer to extract the true target (url= param). If not
-    found, follow a redirect once.
+    Try hard to get the real publisher URL from a Google News RSS entry.
+    Priority:
+      1) feedburner_origlink (some feeds)
+      2) any entry.links[].href not pointing to news.google.com
+      3) first <a href> in the summary that is not news.google.com
+      4) link's ?url= param if present
+      5) follow redirects once and take final URL if it leaves news.google.com
+      6) fallback to entry.link
     """
+    # 1) feedburner_origlink
     try:
+        orig = getattr(entry, "feedburner_origlink", None) or entry.get("feedburner_origlink")
+        if orig and "news.google.com" not in orig:
+            return orig
+    except Exception:
+        pass
+
+    # 2) entry.links[] real href
+    try:
+        for l in entry.get("links", []):
+            href = l.get("href")
+            if href and "news.google.com" not in href:
+                return href
+    except Exception:
+        pass
+
+    # 3) URL inside the summary html
+    try:
+        sm = entry.get("summary", "") or ""
+        if sm:
+            for href in _hrefs_from_html(sm):
+                if "news.google.com" not in href:
+                    return href
+    except Exception:
+        pass
+
+    # 4) ?url= param on entry.link
+    try:
+        link = entry.link
         parsed = urlsplit(link)
         if "news.google.com" in parsed.netloc:
             qs = parse_qs(parsed.query)
             if "url" in qs and qs["url"]:
-                return unquote(qs["url"][0])
-
-            # Fallback: follow redirect
-            try:
-                r = requests.get(
-                    link,
-                    timeout=10,
-                    allow_redirects=True,
-                    headers={"User-Agent": "Mozilla/5.0"},
-                )
-                if r.status_code == 200 and r.url and "news.google.com" not in r.url:
-                    return r.url
-            except Exception:
-                pass
-        return link
+                real = unquote(qs["url"][0])
+                if real:
+                    return real
     except Exception:
-        return link
+        pass
+
+    # 5) follow redirect once
+    try:
+        link = entry.link
+        r = requests.get(
+            link,
+            timeout=10,
+            allow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        if r.status_code == 200 and r.url and "news.google.com" not in r.url:
+            return r.url
+    except Exception:
+        pass
+
+    # 6) fallback
+    try:
+        return entry.link
+    except Exception:
+        return ""
+
+
+def _hrefs_from_html(html: str) -> List[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    hrefs = []
+    for a in soup.find_all("a", href=True):
+        hrefs.append(a["href"])
+    return hrefs
 
 
 def _domain_of(url: str) -> str:
@@ -65,23 +109,23 @@ def fetch_feeds(terms: List[str]) -> List[Dict[str, Any]]:
     all_items: List[Dict[str, Any]] = []
     for term in terms:
         q = quote_plus(f'"{term}"')  # ensure phrase, URL-encoded
-        url = (
-            f"https://news.google.com/rss/search?q={q}+when:2d&hl=en-US&gl=US&ceid=US:en"
-        )
+        url = f"https://news.google.com/rss/search?q={q}+when:2d&hl=en-US&gl=US&ceid=US:en"
         feed = feedparser.parse(url)
         print(f"[gather] term={term!r} fetched={len(feed.entries)} url={url}")
 
         for entry in feed.entries:
-            raw_link = entry.link
-            link = _unwrap_google_news_link(raw_link)
+            link = _unwrap_google_news_link(entry)
+            dom = _domain_of(link)
+            title = entry.title
+
             item = {
-                "title": entry.title,
+                "title": title,
                 "link": link,
                 "published": _parse_date(entry.get("published")),
                 "summary": entry.get("summary", ""),
-                "source": _domain_of(link),
+                "source": dom,
             }
-            print(f"[gather] candidate: {item['title']} — {item['source']} — {link}")
+            print(f"[gather] candidate: {title} — {dom} — {link}")
             all_items.append(item)
 
     return all_items
@@ -107,10 +151,9 @@ def select_and_enrich(
     wl = set((d or "").strip().lower().lstrip("www.") for d in (whitelist_domains or []))
     mm = [t.strip().lower() for t in (must_match_terms or []) if t and t.strip()]
 
-    # newest first
     for it in sorted(items, key=lambda x: x["published"] or datetime.utcnow(), reverse=True):
         url = it["link"]
-        dom = _domain_of(url)
+        dom = it.get("source") or _domain_of(url)
         key = (it["title"], url)
         if key in seen:
             continue
@@ -141,16 +184,13 @@ def select_and_enrich(
             continue
 
         body = strip_boilerplate(body)
-
         if len(body) > max_chars:
             body = body[:max_chars] + "…"
 
         it["body"] = body
         it["source"] = dom
         snip = body[:120].replace("\n", " ")
-        print(
-            f"[gather] KEPT via {method}: {it['title']} — {dom} — len={len(body)} — {snip}…"
-        )
+        print(f"[gather] KEPT via {method}: {it['title']} — {dom} — len={len(body)} — {snip}…")
 
         selected.append(it)
         seen.add(key)
@@ -207,9 +247,7 @@ def _extract_body(url: str) -> Tuple[Optional[str], str]:
 
 def _get(url: str) -> Optional[str]:
     try:
-        r = requests.get(
-            url, timeout=12, headers={"User-Agent": "Mozilla/5.0"}
-        )
+        r = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code != 200:
             print(f"[gather] ERROR {r.status_code} fetching {url}")
             return None
