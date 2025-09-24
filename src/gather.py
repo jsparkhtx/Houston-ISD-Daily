@@ -15,6 +15,8 @@ def select_and_enrich(
 
     seen = set()
     selected: List[Dict[str, Any]] = []
+    
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
     wl = set((d or "").strip().lower().lstrip("www.") for d in (whitelist_domains or []))
     mm = [t.strip().lower() for t in (must_match_terms or []) if t and t.strip()]
