@@ -148,7 +148,7 @@ def main():
     # Build narration and notes
     script_text, notes = build_script(items, tzname)
 
-    # TTS -> MP3 (gTTS version ignores voice/rate but we keep the interface)
+    # TTS -> MP3
     final_mp3 = synth_to_mp3(
         chunks=[script_text],
         voice=cfg.get("voice", "en-US-AriaNeural"),
@@ -162,9 +162,10 @@ def main():
     with open(notes_path, "w") as f:
         f.write(notes)
 
+    # Write full spoken script (this fixes the NameError)
     script_path = os.path.join(DOCS, f"{base_name}_script.txt")
-with open(script_path, "w") as f:
-    f.write(script_text)
+    with open(script_path, "w") as f:
+        f.write(script_text)
 
     # Cleanup old audio
     cleanup_old_audio(int(cfg.get("retain_days", 14)))
