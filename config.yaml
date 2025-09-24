@@ -5,7 +5,7 @@ show_author: "PlayHereHouston"
 show_email: "you@example.com"
 timezone: "America/Chicago"
 max_articles: 12
-max_chars_per_article: 2000
+max_chars_per_article: 2800
 voice: "en-US-AriaNeural"     # edge-tts voice
 voice_rate: "+0%"
 retain_days: 14
