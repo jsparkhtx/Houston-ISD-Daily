@@ -3,13 +3,13 @@ name: Daily Build
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 10 * * *"   # 5:00 AM CT (CDT)
-    - cron: "0 11 * * *"   # 5:00 AM CT (CST)
+    - cron: "0 10 * * *"   # 5:00 AM CT during DST
+    - cron: "0 11 * * *"   # 5:00 AM CT during Standard Time
 
 permissions:
-  contents: read
   pages: write
   id-token: write
+  contents: read
 
 jobs:
   build:
@@ -31,32 +31,24 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Install dependencies
+      - name: Install dependencies (Python + system)
         run: |
+          sudo apt-get update
+          sudo apt-get install -y espeak-ng ffmpeg
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Configure timezone
         run: sudo timedatectl set-timezone America/Chicago
 
-      - name: Run pipeline (WITH TTS)
+      - name: Run pipeline (WITH TTS via eSpeak)
         env:
           TZ: America/Chicago
-          # --- TTS (AWS Polly) ---
-          TTS_PROVIDER: polly
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-          POLLY_VOICE_ID: ${{ secrets.POLLY_VOICE_ID }}    # e.g., Joanna, Matthew, Lupe
-          POLLY_ENGINE: ${{ secrets.POLLY_ENGINE }}        # standard or neural (optional)
-          POLLY_OUTPUT_FORMAT: mp3
-          # --- Podcast metadata ---
-          PODCAST_TITLE: ${{ secrets.PODCAST_TITLE }}
-          PODCAST_AUTHOR: ${{ secrets.PODCAST_AUTHOR }}
-          PODCAST_EMAIL: ${{ secrets.PODCAST_EMAIL }}
-          PODCAST_DESCRIPTION: ${{ secrets.PODCAST_DESCRIPTION }}
-          PODCAST_LINK: ${{ secrets.PODCAST_LINK }}        # e.g., https://jsparkhtx.github.io/Houston-ISD-Daily
-          PODCAST_ART_URL: ${{ secrets.PODCAST_ART_URL }}
+          TTS_PROVIDER: espeak
+          ESPEAK_VOICE: en-us+f3   # female variant
+          ESPEAK_WPM: "165"
+          # Optional podcast metadata; remove if using defaults in code
+          PODCAST_LINK: https://jsparkhtx.github.io/Houston-ISD-Daily
         run: |
           python -m src.main --date today
 
