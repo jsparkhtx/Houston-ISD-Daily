@@ -6,3 +6,4 @@ lxml==5.2.2
 PyYAML==6.0.2
 tqdm==4.66.5
 pytz==2024.1
+lxml_html_clean==0.4.1
