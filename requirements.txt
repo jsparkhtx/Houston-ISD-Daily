@@ -8,3 +8,4 @@ tqdm==4.66.5
 pytz==2024.1
 lxml_html_clean==0.4.1
 gTTS==2.5.1
+pydub==0.25.1
