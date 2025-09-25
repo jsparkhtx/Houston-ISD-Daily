@@ -3,9 +3,13 @@ name: Daily Build
 on:
   workflow_dispatch:
   schedule:
-    # 5:00 AM America/Chicago (handles DST with two cron lines)
-    - cron: "0 10 * * *"   # 5:00 AM CT during Daylight Saving (CDT, UTC-5)
-    - cron: "0 11 * * *"   # 5:00 AM CT during Standard Time (CST, UTC-6)
+    - cron: "0 10 * * *"   # 5:00 AM CT (CDT)
+    - cron: "0 11 * * *"   # 5:00 AM CT (CST)
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
 
 jobs:
   build:
@@ -35,16 +39,49 @@ jobs:
       - name: Configure timezone
         run: sudo timedatectl set-timezone America/Chicago
 
-      - name: Run pipeline (skip TTS in CI)
+      - name: Run pipeline (WITH TTS)
         env:
           TZ: America/Chicago
-          TTS_PROVIDER: none
-        run: python -m src.main --date today --no-tts
+          # --- TTS (AWS Polly) ---
+          TTS_PROVIDER: polly
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          POLLY_VOICE_ID: ${{ secrets.POLLY_VOICE_ID }}    # e.g., Joanna, Matthew, Lupe
+          POLLY_ENGINE: ${{ secrets.POLLY_ENGINE }}        # standard or neural (optional)
+          POLLY_OUTPUT_FORMAT: mp3
+          # --- Podcast metadata ---
+          PODCAST_TITLE: ${{ secrets.PODCAST_TITLE }}
+          PODCAST_AUTHOR: ${{ secrets.PODCAST_AUTHOR }}
+          PODCAST_EMAIL: ${{ secrets.PODCAST_EMAIL }}
+          PODCAST_DESCRIPTION: ${{ secrets.PODCAST_DESCRIPTION }}
+          PODCAST_LINK: ${{ secrets.PODCAST_LINK }}        # e.g., https://jsparkhtx.github.io/Houston-ISD-Daily
+          PODCAST_ART_URL: ${{ secrets.PODCAST_ART_URL }}
+        run: |
+          python -m src.main --date today
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      - name: Stage public site
+        run: |
+          rm -rf public
+          mkdir -p public/episodes
+          cp -R data/episodes/* public/episodes/ || true
+          cp data/feed/podcast.xml public/
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          name: isd-episode
-          path: |
-            data/episodes/**
-            data/feed/podcast.xml
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
