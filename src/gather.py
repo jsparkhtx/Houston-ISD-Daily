@@ -1,284 +1,318 @@
 # src/gather.py
-#
-# Collect candidate stories and enrich them with clean text bodies.
-# Focused on Greater Houston ISDs via a Google News RSS query + robust
-# unwrapping of aggregator links.
-
 from __future__ import annotations
 
 import re
 import time
 import html
 import logging
-from typing import List, Dict, Any, Optional
-from urllib.parse import urlparse, urlsplit, parse_qs, quote_plus
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Iterable, Optional
+from urllib.parse import urlparse, parse_qs, unquote, urlsplit, urlunsplit
 
-import requests
 import feedparser
+import requests
 from bs4 import BeautifulSoup
-from readability import Document
-from email.utils import parsedate_to_datetime
-from datetime import datetime, timedelta, timezone
 
-# ---------- config / constants ----------
+# --------------------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------------------
 
-HTTP_TIMEOUT = 12
-UA = (
+USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
+REQ_TIMEOUT = 12  # seconds
+MAX_PARAGRAPHS_PER_ARTICLE = 12  # keep it tight; the TTS step will stitch these
 
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
-
-HOUSTON_ISD_TERMS = [
-    "Houston ISD", "HISD",
-    "Aldine ISD", "Alief ISD", "Channelview ISD", "Clear Creek ISD",
-    "Crosby ISD", "Cy-Fair ISD", "Cypress-Fairbanks ISD", "Fort Bend ISD", "FBISD",
-    "Galena Park ISD", "Goose Creek CISD", "Huffman ISD", "Humble ISD",
-    "Katy ISD", "Klein ISD", "Pasadena ISD", "Sheldon ISD",
-    "Spring ISD", "Spring Branch ISD",
+# Conservative default Houston-area education feeds (feel free to expand/modify)
+DEFAULT_RSS_FEEDS: List[str] = [
+    # Major local outlets
+    "https://www.houstonpublicmedia.org/feed/",                         # HPM
+    "https://www.khou.com/feeds/rss/category/news/local/education.xml", # KHOU education
+    "https://abc13.com/feed/",                                          # ABC13 (sitewide; we filter by terms)
+    "https://www.click2houston.com/arcio/rss/category/news/local/",     # KPRC local
+    "https://communityimpact.com/houston/feed/",                        # Community Impact (Houston)
+    # District & nearby districts — many publish “news” or “press” RSS
+    "https://www.houstonisd.org/rss.aspx?DomainID=1&ModuleInstanceID=35946&PageID=1",  # HISD site-wide RSS
+    "https://www.fortbendisd.com/site/RSS.aspx?DomainID=1&ModuleInstanceID=581&PageID=1",  # FBISD
+    "https://www.katyisd.org/site/RSS.aspx?DomainID=4&ModuleInstanceID=77&PageID=1",       # Katy ISD
+    "https://www.aldineisd.org/feed/",                                                     # Aldine ISD (WP)
+    "https://kleinisd.net/site/rss.aspx?DomainID=4&ModuleInstanceID=24&PageID=1",         # Klein ISD
 ]
 
-# ---------- helpers ----------
+# --------------------------------------------------------------------------------------
+# Utilities
+# --------------------------------------------------------------------------------------
 
-def _hostname(url: str) -> str:
-    try:
-        return urlparse(url).hostname or ""
-    except Exception:
-        return ""
+def _clean_whitespace(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
 
-def _is_google_wrapper(url: str) -> bool:
-    host = _hostname(url)
-    return (
-        host.endswith("news.google.com") or
-        host.endswith("google.com") or
-        host.endswith("gstatic.com")
-    )
-
-def _unwrap_google_url(url: str) -> str:
+def _strip_tracking(u: str) -> str:
     """
-    For Google News RSS links, try to extract the real publisher URL.
-    We try in this order:
-      1) 'url' query param (many items include it)
-      2) Follow HEAD/GET redirects to the ultimate destination
+    Remove obvious tracking params; also unwrap Google News style URLs when seen.
     """
+    if not u:
+        return u
+
+    # Unwrap news.google.com links like .../articles/....?url=<real>&...
     try:
-        qs = parse_qs(urlsplit(url).query)
-        candidate = qs.get("url", [None])[0]
-        if candidate:
-            return candidate
+        parsed = urlparse(u)
+        if "news.google." in parsed.netloc:
+            qs = parse_qs(parsed.query)
+            if "url" in qs and qs["url"]:
+                return unquote(qs["url"][0])
     except Exception:
         pass
 
-    # Fallback: follow redirects
+    # Remove common tracking parameters
     try:
-        # HEAD first; if some sites block HEAD, fall back to GET with stream=True
-        r = SESSION.head(url, allow_redirects=True, timeout=HTTP_TIMEOUT)
-        if 300 <= r.status_code < 400 and "Location" in r.headers:
-            return r.headers["Location"]
-        if r.url and r.url != url:
-            return r.url
+        parts = urlsplit(u)
+        query = parts.query
+        if query:
+            kept = []
+            for kv in query.split("&"):
+                k = kv.split("=", 1)[0].lower()
+                if k.startswith("utm_") or k in {"fbclid", "gclid"}:
+                    continue
+                kept.append(kv)
+            new_query = "&".join(kept)
+            u = urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
     except Exception:
-        try:
-            r = SESSION.get(url, allow_redirects=True, timeout=HTTP_TIMEOUT, stream=True)
-            final = r.url or url
-            r.close()
-            return final
-        except Exception:
-            pass
-    return url
+        pass
 
-def _clean_text(s: str) -> str:
-    s = html.unescape(s or "")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    return u
 
-def _to_aware(dt: Optional[datetime]) -> datetime:
-    if dt is None:
-        return datetime.now(timezone.utc)
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
 
-def _recent_only(items: List[Dict[str, Any]], hours: int = 24) -> List[Dict[str, Any]]:
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    out = []
-    for it in items:
-        try:
-            pub = it.get("published")
-            if isinstance(pub, datetime) and pub >= cutoff:
-                out.append(it)
-        except Exception:
-            continue
-    return out
-
-def _google_query_feed(terms: List[str]) -> str:
-    """
-    Build a Google News RSS 'search' feed URL, properly URL-encoding the query.
-    We avoid quotes around phrases — Google treats words together,
-    and quote_plus handles spaces safely.
-    """
-    q = " OR ".join(terms) if terms else " OR ".join(HOUSTON_ISD_TERMS)
-    q_enc = quote_plus(q)
-    # when:24h -> last 24 hours; hl/gl/ceid to force English/US.
-    return f"https://news.google.com/rss/search?q={q_enc}+when%3A24h&hl=en-US&gl=US&ceid=US%3Aen"
-
-# ---------- fetching ----------
-
-def _fetch_feed(url: str) -> List[Dict[str, Any]]:
-    """
-    Parse an RSS/Atom feed and return basic entries with best-guess source URLs.
-    """
-    rv: List[Dict[str, Any]] = []
+def _request_url(url: str) -> Optional[requests.Response]:
     try:
-        parsed = feedparser.parse(url)
-    except Exception as e:
-        logging.warning("[gather] feed parse error %s: %s", url, e)
-        return rv
+        resp = requests.get(
+            url,
+            headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"},
+            timeout=REQ_TIMEOUT,
+            allow_redirects=True,
+        )
+        # Only accept HTML-ish
+        ctype = resp.headers.get("Content-Type", "")
+        if "text/html" not in ctype and "application/xhtml" not in ctype:
+            return None
+        if resp.status_code >= 400:
+            return None
+        return resp
+    except requests.RequestException:
+        return None
 
-    for e in parsed.entries:
-        link = e.get("link") or ""
-        if not link:
-            continue
 
-        # Try to make the link the real publisher URL
-        final_link = _unwrap_google_url(link) if _is_google_wrapper(link) else link
-        host = _hostname(final_link) or _hostname(link)
-
-        # Published time -> aware datetime
-        pub_dt: Optional[datetime] = None
-        if "published_parsed" in e and e.published_parsed:
-            try:
-                pub_dt = datetime.fromtimestamp(time.mktime(e.published_parsed), tz=timezone.utc)
-            except Exception:
-                pub_dt = None
-        elif "published" in e:
-            try:
-                pub_dt = parsedate_to_datetime(e.published)
-            except Exception:
-                pub_dt = None
-
-        rv.append({
-            "title": _clean_text(e.get("title", "")),
-            "link": final_link,
-            "raw_link": link,
-            "source": host or "",
-            "published": _to_aware(pub_dt),
-            "summary": _clean_text(e.get("summary", "")),
-        })
-
-    return rv
-
-def fetch_feeds(terms: List[str]) -> List[Dict[str, Any]]:
+def _extract_text_from_html(html_text: str) -> str:
     """
-    Entry point used by main.py
-    Returns raw, recent (<=24h) items from Google News search feed.
+    Lightweight text extraction without readability/lxml_html_clean.
+    Prioritizes <article>, then main content wrappers, then paragraphs.
     """
-    url = _google_query_feed(terms)
-    entries = _fetch_feed(url)
-    # Deduplicate by (title, source)
-    seen = set()
-    uniq: List[Dict[str, Any]] = []
-    for it in entries:
-        key = (it["title"].lower(), it["source"])
-        if key in seen:
-            continue
-        seen.add(key)
-        uniq.append(it)
-    return _recent_only(uniq, hours=24)
+    soup = BeautifulSoup(html_text, "html.parser")
 
-# ---------- enrichment (read body text) ----------
+    # remove scripts/styles/nav/aside/figcaptions which often add noise
+    for bad in soup(["script", "style", "noscript", "header", "footer", "nav", "aside", "form"]):
+        bad.decompose()
 
-def _og_description(soup: BeautifulSoup) -> Optional[str]:
-    meta = soup.find("meta", attrs={"property": "og:description"})
-    if meta and meta.get("content"):
-        return _clean_text(meta["content"])
-    meta2 = soup.find("meta", attrs={"name": "description"})
-    if meta2 and meta2.get("content"):
-        return _clean_text(meta2["content"])
-    return None
+    # Prefer <article> blocks
+    candidates: List[BeautifulSoup] = list(soup.find_all("article"))
 
-def _paragraphs(soup: BeautifulSoup) -> str:
-    parts: List[str] = []
-    for p in soup.find_all("p"):
-        txt = _clean_text(p.get_text(" ", strip=True))
-        if len(txt) >= 40:  # skip nav/short crumbs
-            parts.append(txt)
-        if sum(len(x) for x in parts) > 3000:
+    # Common CMS containers when <article> is missing
+    if not candidates:
+        for sel in [
+            "[role=main]",
+            ".post-content",
+            ".entry-content",
+            ".article__content",
+            ".c-article-body",
+            ".story-body",
+            "#main-content",
+            ".content",
+        ]:
+            found = soup.select_one(sel)
+            if found:
+                candidates.append(found)
+
+    # Fallback to body
+    root = candidates[0] if candidates else soup.body or soup
+
+    # Gather paragraphs
+    paragraphs: List[str] = []
+    for p in root.find_all(["p", "li"]):
+        txt = _clean_whitespace(p.get_text(" ", strip=True))
+        # drop boilerplate or tiny crumbs
+        if len(txt) >= 40 and not txt.lower().startswith(("copyright", "©", "photo:", "video:")):
+            paragraphs.append(txt)
+        if len(paragraphs) >= MAX_PARAGRAPHS_PER_ARTICLE:
             break
-    return " ".join(parts)
 
-def _extract_body(url: str, max_chars: int = 2000) -> str:
+    # Fallback if nothing
+    if not paragraphs:
+        txt = _clean_whitespace(root.get_text(" ", strip=True))
+        return txt[:2000]
+
+    blob = " ".join(paragraphs)
+    return blob[:4000]
+
+
+def _best_published(entry) -> datetime:
     """
-    Try (1) Readability main content, (2) OG/description, (3) <p> fallback.
+    Get a timezone-aware datetime (UTC) from a feed entry, best effort.
     """
+    dt: Optional[datetime] = None
+    for key in ("published_parsed", "updated_parsed"):
+        t = getattr(entry, key, None) or entry.get(key)
+        if t:
+            try:
+                dt = datetime(*t[:6], tzinfo=timezone.utc)
+                break
+            except Exception:
+                pass
+    return dt or datetime.now(tz=timezone.utc)
+
+
+def _host_of(url: str) -> str:
     try:
-        r = SESSION.get(url, timeout=HTTP_TIMEOUT)
-        r.raise_for_status()
-        html_text = r.text
+        return urlparse(url).netloc.lower()
     except Exception:
         return ""
 
-    # Some sites block Readability-lxml on malformed markup — always have fallbacks.
-    try:
-        doc = Document(html_text)
-        content_html = doc.summary(html_partial=True)
-        soup = BeautifulSoup(content_html, "html.parser")
-        text = _clean_text(soup.get_text(" ", strip=True))
-        if len(text) < 120:  # too short → try full page soup instead
-            soup_full = BeautifulSoup(html_text, "html.parser")
-            og = _og_description(soup_full)
-            if og and len(og) > 40:
-                text = og
-            else:
-                text = _paragraphs(soup_full)
-    except Exception:
-        soup_full = BeautifulSoup(html_text, "html.parser")
-        og = _og_description(soup_full)
-        if og and len(og) > 40:
-            text = og
-        else:
-            text = _paragraphs(soup_full)
 
-    if max_chars and len(text) > max_chars:
-        text = text[:max_chars].rsplit(" ", 1)[0] + "…"
-    return text
+def _text_matches_terms(text: str, terms: Iterable[str]) -> bool:
+    if not terms:
+        return True
+    t = text.lower()
+    return any(term.lower() in t for term in terms)
+
+# --------------------------------------------------------------------------------------
+# Core API (used by main.py)
+# --------------------------------------------------------------------------------------
+
+@dataclass
+class Item:
+    title: str
+    link: str
+    source: str
+    published: datetime
+    body: str
+
+
+def fetch_feeds(terms: List[str], rss_feeds: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """
+    Parse the given RSS/Atom feeds (or DEFAULT_RSS_FEEDS), fetch each article page,
+    extract readable text, and return normalized items.
+
+    Returns a list of dicts with keys: title, link, source, published, body
+    """
+    feeds = rss_feeds or DEFAULT_RSS_FEEDS
+    items: List[Item] = []
+
+    for feed_url in feeds:
+        try:
+            parsed = feedparser.parse(feed_url)
+        except Exception:
+            continue
+
+        for entry in parsed.entries or []:
+            try:
+                # Title / link
+                title = _clean_whitespace(entry.get("title", ""))
+                link = entry.get("link") or entry.get("id") or ""
+                link = _strip_tracking(link)
+                if not title or not link:
+                    continue
+
+                # Filter by terms across title + summary
+                summary = _clean_whitespace(html.unescape(entry.get("summary", "")))
+                haystack = f"{title} {summary}"
+                if not _text_matches_terms(haystack, terms):
+                    continue
+
+                # Fetch article
+                resp = _request_url(link)
+                if not resp:
+                    continue
+                final_url = _strip_tracking(resp.url)  # after redirects
+                source = _host_of(final_url)
+
+                text = _extract_text_from_html(resp.text)
+                if not text or len(text) < 120:
+                    # If extraction too thin, skip; avoids “copyright / license” boilerplate
+                    continue
+
+                published = _best_published(entry)
+
+                items.append(Item(
+                    title=title,
+                    link=final_url,
+                    source=source,
+                    published=published,
+                    body=text,
+                ))
+
+                # Be gentle with sites
+                time.sleep(0.2)
+
+            except Exception:
+                # Never let a single bad entry kill the run
+                continue
+
+    # Convert dataclass list -> plain dicts for downstream code
+    out: List[Dict[str, Any]] = [
+        {
+            "title": it.title,
+            "link": it.link,
+            "source": it.source,
+            "published": it.published,
+            "body": it.body,
+        }
+        for it in items
+    ]
+    return out
+
 
 def select_and_enrich(
     raw_items: List[Dict[str, Any]],
     max_articles: int = 12,
-    whitelist_domains: Optional[List[str]] = None,
+    whitelist_domains: Optional[Iterable[str]] = None,
     max_chars: int = 2000,
 ) -> List[Dict[str, Any]]:
     """
-    Filter + enrich with body text.
-    - If whitelist_domains is provided, only keep items whose source ends with one of those domains.
-    - Trim to max_articles after enrichment priority (newest first).
+    - Deduplicate by canonical link
+    - (Optional) Filter to whitelist of domains (netloc match; 'www.' stripped)
+    - Sort newest first
+    - Truncate body to max_chars
     """
-    items = sorted(raw_items, key=lambda x: x.get("published", datetime.now(timezone.utc)), reverse=True)
-
     if whitelist_domains:
-        wl = {d.strip().lower().lstrip("www.") for d in whitelist_domains if d and d.strip()}
-        def ok(src: str) -> bool:
-            s = (src or "").lower().lstrip("www.")
-            return any(s == d or s.endswith("." + d) for d in wl)
-        items = [it for it in items if ok(it.get("source", ""))]
+        wl = {d.lower().lstrip().rstrip().removeprefix("www.") for d in whitelist_domains}
+    else:
+        wl = None
 
-    enriched: List[Dict[str, Any]] = []
-    for it in items:
-        body = _extract_body(it["link"], max_chars=max_chars)
-        if not body:
-            # As a last resort, keep the summary if it has substance
-            body = it.get("summary") or ""
-        body = _clean_text(body)
-        if not body:
+    seen: set[str] = set()
+    cleaned: List[Dict[str, Any]] = []
+
+    for it in raw_items:
+        link = _strip_tracking(it.get("link", ""))
+        if not link or link in seen:
             continue
-        enriched.append({
-            **it,
+        seen.add(link)
+
+        host = _host_of(link).removeprefix("www.")
+        if wl and host not in wl:
+            continue
+
+        body = it.get("body", "")
+        if len(body) > max_chars:
+            body = body[:max_chars].rsplit(" ", 1)[0] + "…"
+
+        cleaned.append({
+            "title": _clean_whitespace(it.get("title", "")),
+            "link": link,
+            "source": host or it.get("source", ""),
+            "published": it.get("published") or datetime.now(tz=timezone.utc),
             "body": body,
         })
-        if len(enriched) >= max_articles:
-            break
 
-    return enriched
+    # newest first
+    cleaned.sort(key=lambda x: x["published"], reverse=True)
+    return cleaned[:max_articles]
