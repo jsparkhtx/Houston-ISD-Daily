@@ -1,0 +1,46 @@
+# Curate and tweak anytime. Order matters (top feeds are weighted higher).
+feeds:
+  - name: Texas Education Agency News
+    url: https://tea.texas.gov/rss.xml
+  - name: Houston ISD Newsroom
+    url: https://www.houstonisd.org/site/handlers/rss.ashx?RCID=455&PID=420&DomainID=4
+  - name: Fort Bend ISD News
+    url: https://www.fortbendisd.com/site/handlers/rss.ashx?RCID=2&PID=1&DomainID=4
+  - name: Katy ISD News
+    url: https://www.katyisd.org/site/handlers/rss.ashx?RCID=2&PID=1&DomainID=4
+  - name: Cy-Fair ISD News
+    url: https://www.cfisd.net/site/handlers/rss.ashx?RCID=25&PID=19&DomainID=4
+  - name: Spring Branch ISD News
+    url: https://www.springbranchisd.com/site/handlers/rss.ashx?RCID=266&PID=208&DomainID=4
+  - name: Aldine ISD News
+    url: https://www.aldineisd.org/site/handlers/rss.ashx?RCID=275&PID=231&DomainID=4
+  - name: Alief ISD News
+    url: https://www.aliefisd.net/site/handlers/rss.ashx?RCID=755&PID=163&DomainID=4
+  - name: Humble ISD News
+    url: https://www.humbleisd.net/site/handlers/rss.ashx?RCID=2&PID=1&DomainID=4
+  - name: Klein ISD News
+    url: https://www.kleinisd.net/site/handlers/rss.ashx?RCID=2&PID=1&DomainID=4
+
+  # Optional: general education news (often paywall-free summaries). Keep these last.
+  - name: EdWeek Top Stories
+    url: https://www.edweek.org/rss
+  - name: Texas Tribune Education
+    url: https://www.texastribune.org/education/feed/
+
+blocklist_domains:
+  - houstonchronicle.com
+  - washingtonpost.com
+  - wsj.com
+  - nytimes.com
+
+soft_word_filters:
+  - sports
+  - athletics
+  - football
+  - volleyball
+  - basketball
+
+# How many top stories to feature in the script
+limits:
+  top_stories: 5
+  quick_hits: 5
